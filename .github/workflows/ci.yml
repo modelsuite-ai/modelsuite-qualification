@@ -1,0 +1,229 @@
+name: CI
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    branches: [ master ]
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    outputs:
+      client_changed: ${{ steps.detect.outputs.client_changed }}
+      server_changed: ${{ steps.detect.outputs.server_changed }}
+      workflow_changed: ${{ steps.detect.outputs.workflow_changed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed areas
+        id: detect
+        run: |
+          set -euo pipefail
+          BASE_REF="${{ github.base_ref }}"
+          # Handle first-commit or empty base
+          if [ -z "$BASE_REF" ] || [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+            echo "client_changed=true" >> $GITHUB_OUTPUT
+            echo "server_changed=true" >> $GITHUB_OUTPUT
+            echo "workflow_changed=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          git fetch --no-tags --prune --depth=1 origin "$BASE_REF" || true
+          CHANGED=$(git diff --name-only origin/$BASE_REF...HEAD || true)
+
+          if echo "$CHANGED" | grep -q '^client/'; then echo "client_changed=true" >> $GITHUB_OUTPUT; else echo "client_changed=false" >> $GITHUB_OUTPUT; fi
+          if echo "$CHANGED" | grep -q '^server/'; then echo "server_changed=true" >> $GITHUB_OUTPUT; else echo "server_changed=false" >> $GITHUB_OUTPUT; fi
+          if echo "$CHANGED" | grep -q '^.github/workflows/'; then echo "workflow_changed=true" >> $GITHUB_OUTPUT; else echo "workflow_changed=false" >> $GITHUB_OUTPUT; fi
+
+  danger:
+    name: danger
+    runs-on: ubuntu-latest
+    needs: changes
+    permissions:
+      pull-requests: write
+      issues: write
+      contents: read
+      statuses: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install danger
+        run: npm install --save-dev danger
+
+      - name: Run danger
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx danger ci
+
+  semgrep:
+    name: semgrep
+    runs-on: ubuntu-latest
+    needs: changes
+    container:
+      image: semgrep/semgrep:latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed JS/TS files
+        id: changed-files
+        run: |
+          set -euo pipefail
+          BASE_REF="${{ github.base_ref }}"
+          if [ -z "$BASE_REF" ] || [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+            echo "No JS/TS files changed, skipping"
+            exit 0
+          fi
+          git fetch --no-tags --prune --depth=1 origin "$BASE_REF" || true
+          git diff --name-only origin/$BASE_REF...HEAD | grep -E '\.(js|ts|jsx|tsx)$' > changed_js_files || true
+          if [ ! -s changed_js_files ]; then
+            echo "No JS/TS files changed, skipping"
+            exit 0
+          fi
+          echo "Files to scan:"
+          cat changed_js_files
+
+      - name: Run semgrep on changed files
+        run: |
+          set -euo pipefail
+          xargs -a changed_js_files semgrep --config .semgrep/rules.yml --error
+
+  test-client:
+    name: test-client
+    runs-on: ubuntu-latest
+    needs: [danger, semgrep, changes]
+    if: ${{ needs.changes.outputs.client_changed == 'true' || needs.changes.outputs.workflow_changed == 'true' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Cache node modules
+        uses: actions/cache@v4
+        with:
+          path: client/node_modules
+          key: ${{ runner.os }}-client-${{ hashFiles('client/package-lock.json') }}
+
+      - name: Install dependencies
+        run: |
+          cd client
+          npm ci
+
+      - name: Run lint
+        run: |
+          cd client
+          npm run lint
+
+      - name: Build
+        env:
+          CI: true
+          VITE_API_URL: ${{ secrets.VITE_API_URL }}
+        run: |
+          cd client
+          npm run build
+
+  test-server:
+    name: test-server
+    runs-on: ubuntu-latest
+    needs: [danger, semgrep, changes]
+    if: ${{ needs.changes.outputs.server_changed == 'true' || needs.changes.outputs.workflow_changed == 'true' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Cache node modules
+        uses: actions/cache@v4
+        with:
+          path: server/node_modules
+          key: ${{ runner.os }}-server-${{ hashFiles('server/package-lock.json') }}
+
+      - name: Install dependencies
+        run: |
+          cd server
+          npm ci
+
+      - name: Run lint
+        run: |
+          cd server
+          npm run lint
+
+      - name: Build
+        env:
+          CI: true
+          NODE_ENV: test
+        run: |
+          cd server
+          npm run build
+
+  on-failure:
+    name: on-failure
+    runs-on: ubuntu-latest
+    needs: [test-client, test-server, danger, semgrep]
+    if: ${{ always() && (needs.danger.result != 'success' || needs.semgrep.result != 'success' || needs['test-client'].result != 'success' || needs['test-server'].result != 'success') }}
+    permissions:
+      pull-requests: write
+      issues: write
+      contents: read
+    steps:
+      - name: Build failure list
+        id: build-failure
+        run: |
+          set -euo pipefail
+          failures=""
+          if [ "${{ needs.danger.result }}" != "success" ]; then failures+="- danger: Danger checks failed\n"; fi
+          if [ "${{ needs.semgrep.result }}" != "success" ]; then failures+="- semgrep: Security/lint rules failed\n"; fi
+          if [ "${{ needs['test-client'].result }}" != "success" ]; then failures+="- test-client: client lint/build failed\n"; fi
+          if [ "${{ needs['test-server'].result }}" != "success" ]; then failures+="- test-server: server lint/build failed\n"; fi
+          echo "failures<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$failures" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Post PR comment and close
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pr = context.payload.pull_request.number;
+            const author = context.payload.pull_request.user.login;
+            const failures = `The following CI jobs failed:\n\n${process.env.FAILURES}`;
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${owner}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+            const body = `@${author}\n\n${failures}\nLogs: ${runUrl}\n\nThis PR will be closed automatically.`;
+            await github.issues.createComment({ owner, repo, issue_number: pr, body });
+            await github.pulls.update({ owner, repo, pull_number: pr, state: 'closed' });
+        env:
+          FAILURES: ${{ steps.build-failure.outputs.failures }}
